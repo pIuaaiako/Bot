@@ -1,0 +1,190 @@
+import os
+import io
+import asyncio
+import aiohttp
+from datetime import datetime
+import sys
+
+# Attempt a clean import of python-telegram-bot
+try:
+    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, CallbackQueryHandler, MessageHandler, filters, ConversationHandler
+except ImportError:
+    # Fallback to absolute imports if needed
+    import telegram
+    from telegram._update import Update
+    from telegram._inlinekeyboardbutton import InlineKeyboardButton
+    from telegram._inlinekeyboardmarkup import InlineKeyboardMarkup
+    from telegram.ext._applicationbuilder import ApplicationBuilder
+    from telegram.ext._commandhandler import CommandHandler
+    from telegram.ext._callbackqueryhandler import CallbackQueryHandler
+    from telegram.ext._messagehandler import MessageHandler
+    from telegram.ext._conversationhandler import ConversationHandler
+    import telegram.ext._filters as filters
+
+# ================== CONFIG ==================
+TELEGRAM_TOKEN = "7249053204:AAGvad3x2mdYDb-AC1iKjz7eMSfUfRc_1tQ"
+API_URL = "http://45.141.27.74:24391/dump.php"
+API_KEY = "dinoshop_M4kHn3pVqS"
+CREDIT_NAME = "DinoShop"
+
+# States for ConversationHandler
+KEYWORD, MODE = range(2)
+
+# ================== API UTILS ==================
+async def query_api(keyword: str, t: int = 1) -> dict:
+    params = {"q": keyword, "t": t, "key": API_KEY}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(API_URL, params=params) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"HTTP {resp.status}")
+            return await resp.json(content_type=None)
+
+def split_bytes(data: bytes, filename: str, max_mb: int = 45) -> list:
+    """Split data into chunks if it exceeds Telegram's file size limit (50MB usually, safe 45MB)."""
+    max_b = max_mb * 1024 * 1024
+    if len(data) <= max_b:
+        return [(filename, io.BytesIO(data))]
+    
+    files = []
+    part = 1
+    for i in range(0, len(data), max_b):
+        chunk = data[i:i + max_b]
+        files.append((f"{os.path.splitext(filename)[0]}_part{part}.txt", io.BytesIO(chunk)))
+        part += 1
+    return files
+
+def safe_filename(name: str) -> str:
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
+
+# ================== HANDLERS ==================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("🔍 ค้นหา (Search)", callback_data='search')],
+        [InlineKeyboardButton("📘 วิธีใช้งาน (Help)", callback_data='help')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    welcome_msg = (
+        "🤖 **DinoDonut Telegram Bot**\n\n"
+        "ระบบค้นหา Log ผ่าน DinoDonut\n"
+        "กดปุ่มด้านล่างเพื่อเริ่มใช้งาน"
+    )
+    
+    if update.message:
+        await update.message.reply_text(welcome_msg, reply_markup=reply_markup, parse_mode='Markdown')
+    elif update.callback_query:
+        await update.callback_query.message.edit_text(welcome_msg, reply_markup=reply_markup, parse_mode='Markdown')
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == 'search':
+        await query.message.reply_text("🔎 กรุณาพิมพ์ **คำค้นหา (Keyword)** ที่ต้องการ:\n(เช่น `pointblank.zepetto.com`)", parse_mode='Markdown')
+        return KEYWORD
+    
+    elif query.data == 'help':
+        help_text = (
+            "📖 **วิธีใช้งาน**\n"
+            "1. กดปุ่ม 🔍 ค้นหา\n"
+            "2. พิมพ์ Keyword ที่ต้องการ\n"
+            "3. เลือกโหมด (0 หรือ 1) หรือพิมพ์อะไรก็ได้เพื่อใช้ค่าเริ่มต้น (1)\n"
+            "4. รอรับไฟล์ทางแชทนี้"
+        )
+        # Add back button
+        keyboard = [[InlineKeyboardButton("🔙 กลับเมนูหลัก", callback_data='back')]]
+        await query.message.edit_text(help_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        return ConversationHandler.END
+
+    elif query.data == 'back':
+        await start(update, context)
+        return ConversationHandler.END
+
+async def get_keyword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyword = update.message.text.strip()
+    context.user_data['keyword'] = keyword
+    
+    await update.message.reply_text(
+        f"คำค้นหา: `{keyword}`\n\n"
+        "👉 กรุณาระบุ **โหมด (Mode)** (0 หรือ 1):\n"
+        "_(พิมพ์เลข 0 หรือ 1, หรือพิมพ์ 'ok' เพื่อใช้ค่าเริ่มต้น 1)_",
+        parse_mode='Markdown'
+    )
+    return MODE
+
+async def get_mode_and_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    mode_input = update.message.text.strip()
+    mode = 1
+    if mode_input in ['0', '1']:
+        mode = int(mode_input)
+    
+    keyword = context.user_data.get('keyword')
+    
+    status_msg = await update.message.reply_text(f"⏳ กำลังค้นหา `{keyword}` (โหมด {mode})...", parse_mode='Markdown')
+    
+    try:
+        start_time = datetime.now()
+        js = await query_api(keyword, mode)
+        
+        if js.get("status") != "success":
+            await status_msg.edit_text(f"❌ ไม่พบข้อมูล: {js.get('message')}")
+            return ConversationHandler.END
+
+        lines = js.get("data", [])
+        elapsed = (datetime.now() - start_time).total_seconds() * 1000
+        filename = f"{safe_filename(keyword)}.txt"
+        
+        summary = (
+            f"✅ **ค้นหาสำเร็จ!**\n"
+            f"• คำค้น: `{keyword}`\n"
+            f"• โหมด: `{mode}`\n"
+            f"• จำนวน: `{len(lines):,}` บรรทัด\n"
+            f"• ใช้เวลา: `{elapsed:.2f} ms`\n"
+            f"• โดย: {CREDIT_NAME}"
+        )
+        
+        await status_msg.edit_text(summary, parse_mode='Markdown')
+        
+        # Prepare and send file(s)
+        content = "\n".join(lines).encode("utf-8")
+        files_to_send = split_bytes(content, filename)
+        
+        for name, bio in files_to_send:
+            bio.seek(0)
+            await update.message.reply_document(document=bio, filename=name, caption=f"📂 ผลลัพธ์สำหรับ: {keyword}")
+            
+    except Exception as e:
+        await status_msg.edit_text(f"❌ เกิดข้อผิดพลาด: {str(e)}")
+        
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('❌ ยกเลิกการค้นหา', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 กลับเมนูหลัก", callback_data='back')]]))
+    return ConversationHandler.END
+
+# ================== MAIN ==================
+def main():
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    # Conversation Handler for Search Flow
+    conv_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(button_handler, pattern='^search$')],
+        states={
+            KEYWORD: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_keyword)],
+            MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_mode_and_search)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel), CallbackQueryHandler(button_handler, pattern='^back$')]
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("panel", start)) # Alias for panel
+    app.add_handler(CallbackQueryHandler(button_handler, pattern='^help$|^back$'))
+    app.add_handler(conv_handler)
+
+    print("✅ Bot is running...")
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
